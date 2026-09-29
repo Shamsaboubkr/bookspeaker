@@ -20,6 +20,11 @@ permissions:
 env:
   FLUTTER_VERSION: '3.24.5'
   APP_NAME: Bookspeaker
+  # Google Drive sync on Windows. This must be a *Desktop app* OAuth client
+  # from the same Google Cloud project as the Android app, otherwise the two
+  # devices cannot see the same progress folder.
+  # Set the repository secret BOOKSPEAKER_DESKTOP_CLIENT_ID to override.
+  DESKTOP_CLIENT_ID: ${{ secrets.BOOKSPEAKER_DESKTOP_CLIENT_ID || '481266824841-utk24fqnq2uhjgnvrokqpfils3dmcosh.apps.googleusercontent.com' }}
 
 jobs:
   windows:
@@ -46,11 +51,27 @@ jobs:
           Write-Host "--- files at the repo root ---"
           Get-ChildItem -Force | Select-Object -First 25 Name | Format-Table -HideTableHeaders
 
-          $bundle = Get-ChildItem -Path . -Recurse -File -ErrorAction SilentlyContinue |
+          # A stale bundle from an earlier upload may still be sitting in the
+          # repo (e.g. inside .github/workflows/). Extracting it would overwrite
+          # the newer files, so candidates are ranked by how close to the repo
+          # root they are - an upload made from the Code page always wins.
+          $candidates = @(Get-ChildItem -Path . -Recurse -File -ErrorAction SilentlyContinue |
                     Where-Object {
                       $_.Name -in @('bookspeaker-src.zip', 'bookspeaker-src.tar.gz') -and
                       $_.FullName -notmatch '\\\.git\\'
-                    } | Select-Object -First 1
+                    } | ForEach-Object {
+                      $rel = $_.FullName.Substring((Get-Location).Path.Length).TrimStart('\')
+                      [pscustomobject]@{
+                        File  = $_
+                        Depth = ($rel -split '\\').Count
+                        Rel   = $rel
+                      }
+                    } | Sort-Object Depth, Rel)
+          foreach ($c in $candidates) {
+            Write-Host "  candidate (depth $($c.Depth)): $($c.Rel)"
+          }
+          $bundle = if ($candidates.Count) { $candidates[0].File } else { $null }
+          if ($bundle) { Write-Host "using: $($bundle.FullName)" }
 
           if ($bundle) {
             Write-Host "Found bundle: $($bundle.FullName) - unpacking to the repo root"
@@ -62,6 +83,11 @@ jobs:
             Write-Host "unpacked"
           } else {
             Write-Host "No bundle anywhere - assuming the source is already in the repo"
+          }
+
+          if (Test-Path 'BUILD_INFO.txt') {
+            Write-Host "--- bundle contents ---"
+            Get-Content 'BUILD_INFO.txt' | ForEach-Object { Write-Host "  $_" }
           }
 
           # Same idea for the installer files: if they were uploaded somewhere
@@ -122,6 +148,24 @@ jobs:
           flutter config --enable-windows-desktop
           git config --system core.longpaths true
 
+      # just_audio has no Windows engine of its own, so play() would silently
+      # do nothing on desktop. This makes sure the engine is declared even if
+      # the source bundle in the repo is an older revision.
+      - name: Ensure the Windows audio engine is declared
+        shell: pwsh
+        run: |
+          $pub = Get-Content pubspec.yaml -Raw
+          if ($pub -match 'just_audio_windows') {
+            Write-Host "Windows audio engine already in pubspec.yaml"
+          } else {
+            Write-Host "Adding just_audio_windows to pubspec.yaml"
+            $pub = $pub -replace '(?m)^(\s*just_audio:\s*\^?[^\r\n]+)', ('$1' + "`r`n  just_audio_windows: ^0.2.3")
+            Set-Content -Path pubspec.yaml -Value $pub -NoNewline
+          }
+          $found = Select-String -Path pubspec.yaml -Pattern 'just_audio_windows'
+          if (-not $found) { throw "The Windows audio engine could not be declared" }
+          Write-Host "OK - declared as:"; $found | ForEach-Object { Write-Host "  $($_.Line.Trim())" }
+
       - name: Get dependencies
         run: flutter pub get
 
@@ -180,7 +224,9 @@ jobs:
       - name: Build the Windows app
         shell: pwsh
         run: |
-          flutter build windows --release --no-tree-shake-icons *>&1 |
+          Write-Host "Google client ID for sync: $env:DESKTOP_CLIENT_ID"
+          flutter build windows --release --no-tree-shake-icons `
+            --dart-define=BOOKSPEAKER_DESKTOP_CLIENT_ID=$env:DESKTOP_CLIENT_ID *>&1 |
             Tee-Object -FilePath build-windows.log
           $code = $LASTEXITCODE
           if ($code -ne 0) {
@@ -276,7 +322,9 @@ jobs:
           Write-Host "version=$version  full=$full"
           Write-Host "appdir=$appdir"
 
-          candle.exe -arch x64 "-dVersion=$version" "-dAppSource=$appdir" Product.wxs harvest.wxs *>&1 |
+          Write-Host "Product.wxs mentions WixCA: $([bool](Select-String -Path Product.wxs -Pattern 'WixCA' -Quiet))"
+          candle.exe -arch x64 "-dVersion=$version" "-dAppSource=$appdir" `
+            -ext WixUIExtension -ext WixUtilExtension Product.wxs harvest.wxs *>&1 |
             Tee-Object -FilePath candle.log
           if ($LASTEXITCODE -ne 0) {
             Add-Content $env:GITHUB_STEP_SUMMARY "`n### candle.exe failed (compiling the installer definition)`n"
@@ -287,7 +335,7 @@ jobs:
             exit 1
           }
 
-          light.exe -ext WixUIExtension -cultures:en-us -b "$appdir" `
+          light.exe -ext WixUIExtension -ext WixUtilExtension -cultures:en-us -b "$appdir" `
             -out "${{ env.APP_NAME }}-$full-x64.msi" Product.wixobj harvest.wixobj *>&1 |
             Tee-Object -FilePath light.log
           if ($LASTEXITCODE -ne 0) {
