@@ -24,7 +24,11 @@ env:
 jobs:
   windows:
     name: Build Windows app + MSI
-    runs-on: windows-latest
+    # Pinned deliberately: the 'latest' image moved to a newer Windows Server
+    # where Flutter cannot find Visual Studio's C++ tools, which makes it fall
+    # back to the VS2019 generator name and fail. windows-2022 is the image
+    # with VS2022 + the Desktop C++ workload that Flutter expects.
+    runs-on: windows-2022
     timeout-minutes: 60
 
     steps:
@@ -132,6 +136,43 @@ jobs:
           Write-Host "version $full  ->  MSI version $msi"
           "full=$full" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "msi=$msi"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # -------------------------------------------------- Visual Studio check
+      # Flutter builds Windows apps with CMake, which needs Visual Studio's
+      # C++ desktop tools. If Flutter cannot find them it silently asks CMake
+      # for the *Visual Studio 16 2019* generator instead of 17 2022, and CMake
+      # then reports "could not find any instance of Visual Studio".
+      - name: Check Visual Studio C++ tools
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $detected = $false
+          if (Test-Path $vswhere) {
+            $json = & $vswhere -all -products * -prerelease -format json -utf8 `
+                      -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 | ConvertFrom-Json
+            foreach ($vs in $json) {
+              Write-Host "Visual Studio found: $($vs.displayName)  at $($vs.installationPath)"
+              $detected = $true
+            }
+          } else {
+            Write-Host "vswhere.exe not present"
+          }
+          "VS_DETECTED=$($detected.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "--- what Flutter sees ---"
+          flutter doctor -v | Select-String -Pattern 'Visual Studio|cmake|Windows Version' -Context 0,2
+
+      # Only runs if the check above found nothing - costs nothing otherwise.
+      - name: Install VS2022 C++ build tools (only if missing)
+        if: env.VS_DETECTED != 'true'
+        shell: pwsh
+        timeout-minutes: 40
+        run: |
+          Write-Host "No Visual Studio C++ tools found - installing them"
+          choco install visualstudio2022buildtools --no-progress -y --package-parameters `
+            "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          & $vswhere -all -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          Write-Host "done"
 
       # ---------------------------------------------------------------- build
       # Output is saved to a file so that, if this ever fails, the reason is
