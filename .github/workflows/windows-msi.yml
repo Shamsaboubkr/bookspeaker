@@ -32,17 +32,50 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Unpack source bundle (only if it is there)
+      # GitHub uploads files into whatever folder you happen to be viewing, so
+      # the bundle often ends up in a subfolder (e.g. .github/workflows/).
+      # This looks for it ANYWHERE in the repo and unpacks it to the root, so
+      # it does not matter where the upload landed.
+      - name: Find and unpack the source bundle
         shell: pwsh
         run: |
-          if (Test-Path 'bookspeaker-src.zip') {
-            Write-Host "Found bookspeaker-src.zip - extracting over the repo"
-            Expand-Archive -Path 'bookspeaker-src.zip' -DestinationPath '.' -Force
-          } elseif (Test-Path 'bookspeaker-src.tar.gz') {
-            Write-Host "Found bookspeaker-src.tar.gz - extracting"
-            tar -xzf bookspeaker-src.tar.gz
+          Write-Host "--- files at the repo root ---"
+          Get-ChildItem -Force | Select-Object -First 25 Name | Format-Table -HideTableHeaders
+
+          $bundle = Get-ChildItem -Path . -Recurse -File -ErrorAction SilentlyContinue |
+                    Where-Object {
+                      $_.Name -in @('bookspeaker-src.zip', 'bookspeaker-src.tar.gz') -and
+                      $_.FullName -notmatch '\\\.git\\'
+                    } | Select-Object -First 1
+
+          if ($bundle) {
+            Write-Host "Found bundle: $($bundle.FullName) - unpacking to the repo root"
+            if ($bundle.Extension -eq '.zip') {
+              Expand-Archive -Path $bundle.FullName -DestinationPath '.' -Force
+            } else {
+              tar -xzf $bundle.FullName
+            }
+            Write-Host "unpacked"
           } else {
-            Write-Host "No bundle found - using the repo source as-is"
+            Write-Host "No bundle anywhere - assuming the source is already in the repo"
+          }
+
+          # Same idea for the installer files: if they were uploaded somewhere
+          # odd, copy them to where the build expects them.
+          $wxs = Get-ChildItem -Path . -Recurse -File -Filter 'Product.wxs' -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -notmatch '\\\.git\\' } | Select-Object -First 1
+          if (-not (Test-Path 'windows/installer/Product.wxs') -and $wxs) {
+            New-Item -ItemType Directory -Force -Path 'windows/installer' | Out-Null
+            Copy-Item $wxs.FullName 'windows/installer/Product.wxs'
+            Write-Host "copied Product.wxs -> windows/installer/"
+          }
+
+          $ico = Get-ChildItem -Path . -Recurse -File -Filter 'bookspeaker.ico' -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -notmatch '\\\.git\\' } | Select-Object -First 1
+          if (-not (Test-Path 'windows/installer/bookspeaker.ico') -and $ico) {
+            New-Item -ItemType Directory -Force -Path 'windows/installer' | Out-Null
+            Copy-Item $ico.FullName 'windows/installer/bookspeaker.ico'
+            Write-Host "copied bookspeaker.ico -> windows/installer/"
           }
 
       - name: Check the project is complete
@@ -57,8 +90,9 @@ jobs:
           )
           $missing = @($need | Where-Object { -not (Test-Path $_) })
           if ($missing.Count) {
-            Write-Host "::error::Missing files: $($missing -join ', ')"
-            throw "Upload the source bundle (bookspeaker-src.zip) and try again"
+            Write-Host "::error::Still missing: $($missing -join ', ')"
+            Write-Host "The source bundle (bookspeaker-src.zip) was not found anywhere in the repo."
+            throw "Add bookspeaker-src.zip to the repository (upload it on the main Code page, not inside a folder) and run the workflow again."
           }
           Write-Host "Project looks complete."
 
