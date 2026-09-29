@@ -231,20 +231,39 @@ jobs:
               $got = $true; break
             } catch { Write-Host "  failed: $($_.Exception.Message)" }
           }
-          if (-not $got) { throw "Could not download WiX 3.14" }
-          Expand-Archive -Path $zip -DestinationPath $wix -Force
-          $wix | Out-File -FilePath $env:GITHUB_PATH -Append
-          Get-ChildItem $wix -Filter 'candle.exe' | Select-Object -First 1 FullName
+          if ($got) {
+            Expand-Archive -Path $zip -DestinationPath $wix -Force
+            $wix | Out-File -FilePath $env:GITHUB_PATH -Append
+          } else {
+            Write-Host "Downloads failed - falling back to the package manager"
+            choco install wixtoolset --version=3.14.1 --no-progress -y
+            $alt = "${env:ProgramFiles(x86)}\WiX Toolset v3.14\bin"
+            if (-not (Test-Path "$alt\candle.exe")) { throw "WiX 3.14 is not available" }
+            $alt | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+          Write-Host "WiX ready:"
+          Get-ChildItem ($env:GITHUB_PATH, "${env:ProgramFiles(x86)}\WiX Toolset v3.14\bin" |
+            Where-Object { $_ } | ForEach-Object { $_ } | Select-Object -First 1) -ErrorAction SilentlyContinue
+          where.exe heat.exe 2>$null; where.exe candle.exe 2>$null
 
       - name: Turn the built files into an installer package
         shell: pwsh
         working-directory: windows/installer
         run: |
           # heat.exe lists every file in the build output as an installer component
+          # -arch x64 marks the components 64-bit, matching the x64 package.
           heat.exe dir "..\..\build\windows\x64\runner\Release" `
-            -cg AppFiles -gg -sfrag -srd -dr INSTALLFOLDER `
-            -var var.AppSource -out harvest.wxs
-          if (-not (Test-Path harvest.wxs)) { throw "heat.exe produced nothing" }
+            -cg AppFiles -gg -sfrag -srd -dr INSTALLFOLDER -arch x64 `
+            -var var.AppSource -out harvest.wxs *>&1 | Tee-Object -FilePath heat.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0 -or -not (Test-Path harvest.wxs)) {
+            Add-Content $env:GITHUB_STEP_SUMMARY "`n### heat.exe failed`n"
+            Add-Content $env:GITHUB_STEP_SUMMARY '```'
+            Get-Content heat.log -Tail 40 | Add-Content $env:GITHUB_STEP_SUMMARY
+            Add-Content $env:GITHUB_STEP_SUMMARY '```'
+            Write-Host "::error::heat.exe failed (exit $code)"
+            exit 1
+          }
           Write-Host "packaged $((Select-String -Path harvest.wxs -Pattern '<File ' -AllMatches).Matches.Count) files"
 
       - name: Build the .msi
@@ -254,13 +273,31 @@ jobs:
           $version = '${{ steps.version.outputs.msi }}'
           $full    = '${{ steps.version.outputs.full }}'
           $appdir  = (Resolve-Path '..\..\build\windows\x64\runner\Release').Path
+          Write-Host "version=$version  full=$full"
+          Write-Host "appdir=$appdir"
 
-          candle.exe -arch x64 -dVersion=$version -dAppSource="$appdir" Product.wxs harvest.wxs
-          if ($LASTEXITCODE -ne 0) { throw "candle.exe (compile) failed" }
+          candle.exe -arch x64 "-dVersion=$version" "-dAppSource=$appdir" Product.wxs harvest.wxs *>&1 |
+            Tee-Object -FilePath candle.log
+          if ($LASTEXITCODE -ne 0) {
+            Add-Content $env:GITHUB_STEP_SUMMARY "`n### candle.exe failed (compiling the installer definition)`n"
+            Add-Content $env:GITHUB_STEP_SUMMARY '```'
+            Get-Content candle.log -Tail 40 | Add-Content $env:GITHUB_STEP_SUMMARY
+            Add-Content $env:GITHUB_STEP_SUMMARY '```'
+            Write-Host "::error::candle.exe failed"
+            exit 1
+          }
 
           light.exe -ext WixUIExtension -cultures:en-us -b "$appdir" `
-            -out "${{ env.APP_NAME }}-$full-x64.msi" Product.wixobj harvest.wixobj
-          if ($LASTEXITCODE -ne 0) { throw "light.exe (link) failed" }
+            -out "${{ env.APP_NAME }}-$full-x64.msi" Product.wixobj harvest.wixobj *>&1 |
+            Tee-Object -FilePath light.log
+          if ($LASTEXITCODE -ne 0) {
+            Add-Content $env:GITHUB_STEP_SUMMARY "`n### light.exe failed (linking the .msi)`n"
+            Add-Content $env:GITHUB_STEP_SUMMARY '```'
+            Get-Content light.log -Tail 40 | Add-Content $env:GITHUB_STEP_SUMMARY
+            Add-Content $env:GITHUB_STEP_SUMMARY '```'
+            Write-Host "::error::light.exe failed"
+            exit 1
+          }
 
           Get-ChildItem *.msi | Select-Object Name, Length
 
