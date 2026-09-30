@@ -20,11 +20,15 @@ permissions:
 env:
   FLUTTER_VERSION: '3.24.5'
   APP_NAME: Bookspeaker
-  # Google Drive sync on Windows. This must be a *Desktop app* OAuth client
-  # from the same Google Cloud project as the Android app, otherwise the two
-  # devices cannot see the same progress folder.
-  # Set the repository secret BOOKSPEAKER_DESKTOP_CLIENT_ID to override.
-  DESKTOP_CLIENT_ID: ${{ secrets.BOOKSPEAKER_DESKTOP_CLIENT_ID || '481266824841-utk24fqnq2uhjgnvrokqpfils3dmcosh.apps.googleusercontent.com' }}
+  # Google Drive sync credentials, compiled into the app so no user ever has to
+  # paste them: install on any PC and sign-in works immediately.
+  #   * The client must be a *Desktop app* OAuth client (Google blocks the
+  #     sign-in flow for every other type).
+  #   * It must live in the same Cloud project as the Android app.
+  # A repository secret of the same name overrides the value here, which is the
+  # cleaner place to keep them if this repository is ever made public.
+  DESKTOP_CLIENT_ID: ${{ secrets.BOOKSPEAKER_DESKTOP_CLIENT_ID || '481266824841-heied9j0d51alb848b8odiffd2nkgiud.apps.googleusercontent.com' }}
+  DESKTOP_CLIENT_SECRET: ${{ secrets.BOOKSPEAKER_DESKTOP_CLIENT_SECRET || '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' }}
 
 jobs:
   windows:
@@ -225,8 +229,12 @@ jobs:
         shell: pwsh
         run: |
           Write-Host "Google client ID for sync: $env:DESKTOP_CLIENT_ID"
+          if ([string]::IsNullOrWhiteSpace($env:DESKTOP_CLIENT_SECRET)) {
+            Write-Host "::warning::No client secret set - sign-in will fail at the token step"
+          }
           flutter build windows --release --no-tree-shake-icons `
-            --dart-define=BOOKSPEAKER_DESKTOP_CLIENT_ID=$env:DESKTOP_CLIENT_ID *>&1 |
+            --dart-define=BOOKSPEAKER_DESKTOP_CLIENT_ID=$env:DESKTOP_CLIENT_ID `
+            --dart-define=BOOKSPEAKER_DESKTOP_CLIENT_SECRET=$env:DESKTOP_CLIENT_SECRET *>&1 |
             Tee-Object -FilePath build-windows.log
           $code = $LASTEXITCODE
           if ($code -ne 0) {
@@ -378,6 +386,9 @@ jobs:
         shell: pwsh
         run: |
           Add-Content $env:GITHUB_STEP_SUMMARY "`n## Bookspeaker for Windows`n"
+          Add-Content $env:GITHUB_STEP_SUMMARY ("Drive sync compiled in: client id ``" +
+            $env:DESKTOP_CLIENT_ID.Substring(0, 24) + "…``, secret " +
+            $(if ([string]::IsNullOrWhiteSpace($env:DESKTOP_CLIENT_SECRET)) { "MISSING" } else { "present" }) + "`n")
           $found = $false
           Get-ChildItem build/msi -ErrorAction SilentlyContinue |
             Where-Object { $_.Extension -eq '.msi' } | ForEach-Object {
